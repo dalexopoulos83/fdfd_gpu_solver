@@ -193,7 +193,14 @@ same pure NumPy/SciPy `pyfdfdsolver` code path.
 
 ## Citation
 
-DOI: *pending (Zenodo archival)* -- see [CITATION.cff](CITATION.cff) for citation metadata and the
-accompanying paper reference. This is a fork of
-[pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver); see that repo for the base CPU
-solver's own DOI.
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23068665.svg)](https://doi.org/10.5281/zenodo.23068665)
+
+If you use this software, please cite it via the DOI above (always resolves to the latest
+version; see [CITATION.cff](CITATION.cff) for structured metadata), and please also cite the
+accompanying paper for the method itself:
+
+> D. Alexopoulos and T. Kamalakis, "Implementation of a Finite Difference Frequency Domain Mode
+> Solver Incorporating Subpixel Smoothing" (2025).
+
+This is a fork of [pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver), which cites the
+same paper directly rather than carrying its own separate software DOI.

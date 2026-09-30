@@ -7,6 +7,7 @@ authors:
     given-names: "Dimitris"
 repository-code: "https://github.com/dalexopoulos83/fdfd_gpu_solver"
 license: "GPL-3.0"
+doi: "10.5281/zenodo.23068665"
 abstract: "GPU-accelerated (PyCUDA) and non-uniform-grid extension of pyfdfdsolver, a 2D Finite Difference Frequency Domain (FDFD) mode solver for photonic waveguides."
 preferred-citation:
   type: article
