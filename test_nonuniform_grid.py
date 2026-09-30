@@ -159,20 +159,49 @@ class PmlComposesWithNonUniformGridTest(unittest.TestCase):
         self.assertLess(neff.imag, neff.real)
 
 
-class UseGpuRejectsNonUniformGridTest(unittest.TestCase):
-    """gpu_backend's kernels still assume a single global Dx/Dy (scalar
-    probe radius / voxel window), so use_gpu=True + a non-uniform grid
-    must fail loudly, not silently give a wrong answer."""
+try:
+    import pycuda.driver as _cuda_driver
+    _cuda_driver.init()
+    _HAS_GPU = _cuda_driver.Device.count() > 0
+except Exception:
+    _HAS_GPU = False
 
-    def test_raises_not_implemented(self):
+
+@unittest.skipUnless(_HAS_GPU, "no CUDA device / pycuda available")
+class GpuMatchesCpuOnNonUniformGridTest(unittest.TestCase):
+    """gpu_backend.gpu_orth_vectors/gpu_eavg accept a per-boundary-point
+    array (local cell size, which genuinely varies on a non-uniform grid)
+    as well as the scalar a uniform grid uses -- this is the GPU-side half
+    of the same local-cell-size fix calc_orth_vectors/calc_eavg already
+    needed on the CPU side (see their "anisotropic cell" docstring)."""
+
+    def test_matches_cpu_on_graded_grid(self):
+        N, L = 60, 3.0
+        W, H = 0.5, 0.3
         geometry = [
             {'type': 'rectangle', 'x1': -np.inf, 'x2': np.inf, 'y1': -np.inf, 'y2': np.inf,
              'e_value_inside': 1.0 ** 2},
+            {'type': 'rectangle', 'x1': -W / 2, 'x2': W / 2, 'y1': -H / 2, 'y2': H / 2,
+             'e_value_inside': 3.47 ** 2},
         ]
-        edges = np.linspace(-1.0, 1.0, 20)
-        with self.assertRaises(NotImplementedError):
-            yee_grid(Nx=20, Ny=20, Dx=1.0, Dy=1.0, calldicts=geometry, omega=1.0,
-                     nmodes=1, ntarget=1.0, use_gpu=True, x_edges=edges, y_edges=edges)
+        x_edges = graded_edges(N, -L / 2, L / 2, targets=[-W / 2, W / 2], width=0.08, boost=8.0)
+        y_edges = graded_edges(N, -L / 2, L / 2, targets=[-H / 2, H / 2], width=0.08, boost=8.0)
+
+        def build(use_gpu):
+            s = yee_grid(Nx=N, Ny=N, Dx=1.0, Dy=1.0, calldicts=geometry, xmin=-L / 2, ymin=-L / 2,
+                         omega=2 * np.pi * C0 / 1.55, nmodes=1, ntarget=3.47 * 0.9, averaging='tensor',
+                         dPML=0, x_edges=x_edges, y_edges=y_edges, use_gpu=use_gpu)
+            s.solve()
+            return s
+
+        s_cpu = build(use_gpu=False)
+        s_gpu = build(use_gpu=True)
+
+        np.testing.assert_allclose(s_cpu.nx, s_gpu.nx, atol=1e-8)
+        np.testing.assert_allclose(s_cpu.ny, s_gpu.ny, atol=1e-8)
+        np.testing.assert_allclose(s_cpu.eavg, s_gpu.eavg, atol=1e-6)
+        np.testing.assert_allclose(s_cpu.eiavg, s_gpu.eiavg, atol=1e-6)
+        np.testing.assert_allclose(s_cpu.neff_q, s_gpu.neff_q, atol=1e-6)
 
 
 if __name__ == '__main__':

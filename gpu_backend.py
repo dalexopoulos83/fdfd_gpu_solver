@@ -264,7 +264,7 @@ __device__ void cardinal_snap_cos_sin(double theta, double* c_out, double* s_out
 // sign as the input -- ties (imag==0) go to the positive branch).
 extern "C" __global__ void orth_vectors_kernel(
     const double* __restrict__ xb, const double* __restrict__ yb, int n_boundary,
-    double r0,
+    const double* __restrict__ r0_arr,
     const int* __restrict__ shape_types, const double* __restrict__ shape_params, int n_shapes,
     const double* __restrict__ layers, const double* __restrict__ thetas,
     double* __restrict__ nx_out, double* __restrict__ ny_out)
@@ -273,6 +273,7 @@ extern "C" __global__ void orth_vectors_kernel(
     if (i >= n_boundary) return;
 
     double x0 = xb[i], y0 = yb[i];
+    double r0 = r0_arr[i];
     double sx_re = 0.0, sx_im = 0.0, sy_re = 0.0, sy_im = 0.0;
 
     for (int k = 0; k < N_THETA_PROBE; ++k) {
@@ -316,7 +317,7 @@ extern "C" __global__ void orth_vectors_kernel(
 // changed).
 extern "C" __global__ void eavg_kernel(
     const double* __restrict__ xb, const double* __restrict__ yb, int n_boundary,
-    double Dx, double Dy, int voxel_xsize, int voxel_ysize,
+    const double* __restrict__ dx_arr, const double* __restrict__ dy_arr, int voxel_xsize, int voxel_ysize,
     const int* __restrict__ shape_types, const double* __restrict__ shape_params, int n_shapes,
     const double* __restrict__ layers, const double* __restrict__ thetas,
     double* __restrict__ eavg_real_out, double* __restrict__ eavg_imag_out,
@@ -330,6 +331,7 @@ extern "C" __global__ void eavg_kernel(
     if (point_idx >= n_boundary) return;
 
     double x0 = xb[point_idx], y0 = yb[point_idx];
+    double Dx = dx_arr[point_idx], Dy = dy_arr[point_idx];
     double xmin = x0 - Dx * 0.5, xmax = x0 + Dx * 0.5;
     double ymin = y0 - Dy * 0.5, ymax = y0 + Dy * 0.5;
     int total = voxel_xsize * voxel_ysize;
@@ -459,8 +461,24 @@ def _get_module():
     return _module
 
 
+def _per_point_array(value, n):
+    """Normalizes `value` (a scalar or an array of length n) to a
+    contiguous float64 array of length n -- lets a non-uniform grid pass a
+    genuinely per-boundary-point value (local cell size varies) while a
+    uniform grid can still pass a single scalar for convenience/backward
+    compatibility."""
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = np.full(n, float(arr), dtype=np.float64)
+    elif arr.shape != (n,):
+        raise ValueError(f"expected a scalar or shape ({n},) array, got shape {arr.shape}")
+    return np.ascontiguousarray(arr)
+
+
 def gpu_orth_vectors(xb, yb, r0, shape_types, shape_params, layers, thetas, block_size=128):
     """GPU implementation of yee_grid.calc_orth_vectors' per-point loop.
+    `r0` is the probe radius -- a scalar (uniform grid) or a per-boundary-
+    point array (non-uniform grid, where the local cell size varies).
     Returns (nx, ny) as float64 arrays, one value per boundary point."""
     import pycuda.driver as cuda
 
@@ -479,7 +497,7 @@ def gpu_orth_vectors(xb, yb, r0, shape_types, shape_params, layers, thetas, bloc
         cuda.In(np.ascontiguousarray(xb, dtype=np.float64)),
         cuda.In(np.ascontiguousarray(yb, dtype=np.float64)),
         np.int32(n),
-        np.float64(r0),
+        cuda.In(_per_point_array(r0, n)),
         cuda.In(shape_types), cuda.In(shape_params), np.int32(n_shapes),
         cuda.In(layers), cuda.In(thetas),
         cuda.Out(nx_out), cuda.Out(ny_out),
@@ -489,10 +507,13 @@ def gpu_orth_vectors(xb, yb, r0, shape_types, shape_params, layers, thetas, bloc
 
 
 def gpu_eavg(xb, yb, Dx, Dy, voxel_xsize, voxel_ysize, shape_types, shape_params, layers, thetas, block_size=256):
-    """GPU implementation of yee_grid.calc_eavg's per-point loop. Returns
-    (eavg_real, eavg_imag, eiavg_real, eiavg_imag) as float64 arrays, one
-    value per boundary point -- combine as eavg = eavg_real + 1j*eavg_imag
-    (and likewise for eiavg) on the Python side."""
+    """GPU implementation of yee_grid.calc_eavg's per-point loop. `Dx`/`Dy`
+    are the sub-pixel voxel window's full width -- a scalar (uniform grid)
+    or a per-boundary-point array (non-uniform grid, where the local cell
+    size varies). Returns (eavg_real, eavg_imag, eiavg_real, eiavg_imag)
+    as float64 arrays, one value per boundary point -- combine as
+    eavg = eavg_real + 1j*eavg_imag (and likewise for eiavg) on the Python
+    side."""
     import pycuda.driver as cuda
 
     n = xb.shape[0]
@@ -512,7 +533,8 @@ def gpu_eavg(xb, yb, Dx, Dy, voxel_xsize, voxel_ysize, shape_types, shape_params
         cuda.In(np.ascontiguousarray(xb, dtype=np.float64)),
         cuda.In(np.ascontiguousarray(yb, dtype=np.float64)),
         np.int32(n),
-        np.float64(Dx), np.float64(Dy), np.int32(voxel_xsize), np.int32(voxel_ysize),
+        cuda.In(_per_point_array(Dx, n)), cuda.In(_per_point_array(Dy, n)),
+        np.int32(voxel_xsize), np.int32(voxel_ysize),
         cuda.In(shape_types), cuda.In(shape_params), np.int32(n_shapes),
         cuda.In(layers), cuda.In(thetas),
         cuda.Out(eavg_real), cuda.Out(eavg_imag),

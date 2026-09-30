@@ -1,9 +1,8 @@
 # fdfd_gpu_solver
 
 Extended variant of [pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver)'s FDFD mode
-solver: PyCUDA acceleration for grid construction, plus non-uniform (graded) grid support. The two
-features are independent and can be used separately (see "Not in scope" for the one combination
-that isn't supported yet: `use_gpu=True` together with a non-uniform grid).
+solver: PyCUDA acceleration for grid construction, plus non-uniform (graded) grid support -- and
+the two compose: `use_gpu=True` works together with `x_edges`/`y_edges`.
 
 ## What's accelerated, and why just this
 
@@ -127,6 +126,14 @@ close solved answer.
 depth is measured in actual physical length regardless of grading) -- the grid-stretch composition
 was removed from it, back to exactly the form validated in `pyfdfdsolver`.
 
+### GPU support
+
+`gpu_backend.gpu_orth_vectors`/`gpu_eavg` accept the probe radius / voxel-window size as either a
+scalar (uniform grid) or a per-boundary-point array (non-uniform grid, where the local cell size
+genuinely varies) -- the same local-cell-size fix `calc_orth_vectors`/`calc_eavg` already needed on
+the CPU side. Verified to agree with the CPU path to ~1e-15 on a graded grid
+(`test_nonuniform_grid.py`'s `GpuMatchesCpuOnNonUniformGridTest`).
+
 ### Does it actually help?
 
 `test_nonuniform_grid.py`'s `GradedGridImprovesAccuracyTest`, on the paper-validated step-index
@@ -180,10 +187,6 @@ same pure NumPy/SciPy `pyfdfdsolver` code path.
 
 ## Not in scope here
 
-- **`use_gpu=True` with a non-uniform grid** -- `gpu_backend`'s kernels still assume a single
-  global `Dx`/`Dy` for the sub-pixel voxel window and probe radius, not a per-point local cell
-  width; `yee_grid.__init__` raises `NotImplementedError` for this combination rather than
-  silently giving a wrong answer. Use `use_gpu=False` for a non-uniform grid for now.
 - **GPU eigensolver** -- `scipy.sparse.linalg.eigs` (CPU/ARPACK) is unchanged; porting the
   shift-invert generalized sparse eigenproblem to `cuSOLVER`/`cuSPARSE` was explicitly scoped out
   as a much larger, separate undertaking.

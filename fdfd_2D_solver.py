@@ -253,14 +253,6 @@ class yee_grid:
         self.nmodes = nmodes
         self.ntarget = ntarget
 
-        if self.use_gpu and self._is_nonuniform:
-            raise NotImplementedError(
-                "use_gpu=True does not yet support a non-uniform grid "
-                "(x_edges/y_edges): gpu_backend's kernels still assume a "
-                "single global Dx/Dy for the probe radius and sub-pixel "
-                "voxel window, not a per-point local cell width. Use "
-                "use_gpu=False for a non-uniform grid for now.")
-
         self.ie = np.arange(0, 2 * self.Nx)
         self.je = np.arange(0, 2 * self.Ny)
         self.im = np.arange(0, 2 * self.Nx)
@@ -451,13 +443,13 @@ class yee_grid:
 
         if self.use_gpu and self.ib.size > 0:
             import gpu_backend
-            # __init__ already rejects use_gpu with a non-uniform grid, so
-            # r0_all is a single repeated value here and this scalar r0 is
-            # exact, not an approximation.
-            r0 = float(r0_all[0]) if r0_all.size else 0.0
+            # r0_all already carries the correct per-point value for both
+            # the uniform case (a single repeated value) and the
+            # non-uniform case (genuinely varies per point, see above) --
+            # gpu_orth_vectors accepts either a scalar or a per-point array.
             shape_types, shape_params, layers, thetas = gpu_backend.serialize_geometry(self.calldicts)
             nx_vals, ny_vals = gpu_backend.gpu_orth_vectors(
-                self.xb, self.yb, r0, shape_types, shape_params, layers, thetas)
+                self.xb, self.yb, r0_all, shape_types, shape_params, layers, thetas)
             self.nx[self.ib, self.jb] = nx_vals
             self.ny[self.ib, self.jb] = ny_vals
             return
@@ -507,22 +499,24 @@ class yee_grid:
         self.eavg = np.copy(self.e)
 
         if self.averaging != 'none':
+            # Local physical cell size at each boundary point -- reduces to
+            # a uniform Dx/Dy everywhere when the grid is uniform, but
+            # genuinely varies per point on a non-uniform grid (see
+            # calc_orth_vectors above for the same quantity's other use).
+            local_dx = self._Sx_grid_1d[self.ib] * self.Dx
+            local_dy = self._Sy_grid_1d[self.jb] * self.Dy
+
             if self.use_gpu and self.ib.size > 0:
                 import gpu_backend
-                x0_all = self.x(self.ib)
-                y0_all = self.y(self.jb)
                 shape_types, shape_params, layers, thetas = gpu_backend.serialize_geometry(self.calldicts)
                 eavg_re, eavg_im, eiavg_re, eiavg_im = gpu_backend.gpu_eavg(
-                    x0_all, y0_all, self.Dx, self.Dy, self.voxel_xsize, self.voxel_ysize,
+                    self.xb, self.yb, local_dx, local_dy, self.voxel_xsize, self.voxel_ysize,
                     shape_types, shape_params, layers, thetas)
                 self.eavg_col = eavg_re + 1j * eavg_im
                 self.eiavg_col = eiavg_re + 1j * eiavg_im
                 self.eavg[self.ib, self.jb] = self.eavg_col
                 self.eiavg[self.ib, self.jb] = self.eiavg_col
                 return
-
-            local_dx = self._Sx_grid_1d[self.ib] * self.Dx
-            local_dy = self._Sy_grid_1d[self.jb] * self.Dy
 
             for i, ib in enumerate(self.ib):
                 jb = self.jb[i]
