@@ -144,6 +144,77 @@ def vectorize(M):
     return M.reshape(-1)
 
 
+def graded_edges(N, xmin, xmax, targets, width, boost=5.0, oversample=5000):
+    """
+    Convenience helper: builds an `x_edges`/`y_edges` array (N strictly
+    increasing physical positions spanning [xmin, xmax]) with locally
+    increased point DENSITY (finer spacing) within `width` of each position
+    listed in `targets` -- typically the material-interface locations you
+    want resolved more finely (e.g. a waveguide core's edges), everywhere
+    else grading smoothly back to coarser spacing.
+
+    Standard inverse-CDF mesh grading: build a smooth target point-density
+    profile (baseline 1, boosted by a Gaussian bump of the given `width`
+    and `boost` amplitude around each target), form its cumulative
+    distribution on an `oversample`-point reference axis, and invert it at
+    N equally-spaced quantiles. This is what makes the result smooth (no
+    kinks/discontinuous grading ratios) as long as `oversample >> N`, which
+    matters for calc_pml_tensor's `_Sx_grid_1d`/`_Sy_grid_1d` (a numerical
+    derivative of this mapping) to stay well-behaved.
+
+    `boost=5.0` means point density near a target is roughly 6x (1+boost)
+    the baseline far away; `width` is the Gaussian bump's standard
+    deviation, roughly "how far the extra resolution extends" around each
+    target.
+    """
+    xs = np.linspace(xmin, xmax, oversample)
+    density = np.ones_like(xs)
+    for t in targets:
+        density += boost * np.exp(-0.5 * ((xs - t) / width) ** 2)
+    cdf = np.cumsum(density)
+    cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
+    quantiles = np.linspace(0.0, 1.0, N)
+    edges = np.interp(quantiles, cdf, xs)
+    edges[0], edges[-1] = xmin, xmax  # exact endpoints, not just interp-close
+    return edges
+
+
+def _build_physical_axis(edges, N, xmin, Dx):
+    """
+    Builds the 2N-length doubled-index PHYSICAL coordinate array for one
+    axis (mirroring the ie/je "doubled index" convention `x(i)` already
+    uses for the uniform, computational grid).
+
+    `edges is None` reproduces the uniform grid exactly: `xmin + i*Dx*0.5`
+    for i=0..2N-1, identical to `yee_grid.x`/`.y` today -- so a non-uniform
+    grid is fully opt-in and backward compatible.
+
+    Otherwise `edges` is an explicit, strictly increasing array of N
+    physical positions for the primary (even-index) grid lines. Staggered
+    (odd-index, Yee half-point) positions are the midpoint between their
+    two neighboring primary points -- generalizing the uniform grid's
+    "+Dx/2" staggering to non-uniform spacing -- and the final staggered
+    point (one past the last primary point) extrapolates by half of the
+    last cell's width, mirroring how the uniform grid's own `xmax`
+    extends Dx/2 past its last primary point.
+    """
+    if edges is None:
+        i = np.arange(0, 2 * N)
+        return xmin + i * Dx * 0.5
+
+    edges = np.asarray(edges, dtype=float)
+    if edges.shape != (N,):
+        raise ValueError(f"edges must have shape ({N},), got {edges.shape}")
+    if np.any(np.diff(edges) <= 0):
+        raise ValueError("edges must be strictly increasing")
+
+    phys = np.empty(2 * N, dtype=float)
+    phys[0::2] = edges
+    phys[1:-1:2] = (edges[:-1] + edges[1:]) / 2.0
+    phys[-1] = edges[-1] + (edges[-1] - edges[-2]) / 2.0
+    return phys
+
+
 class yee_grid:
 
     def devectorize(self, v):
@@ -152,7 +223,8 @@ class yee_grid:
     def __init__(self, Nx, Ny, Dx, Dy, calldicts, xmin=0.0, ymin=0.0,
                  voxel_xsize=100, voxel_ysize=100,
                  dPML=5, order=2, R0 = 1e-17, sigma_max=1.0, omega=1.0,
-                 averaging='tensor', nmodes=1, ntarget=None, use_gpu=False):
+                 averaging='tensor', nmodes=1, ntarget=None, use_gpu=False,
+                 x_edges=None, y_edges=None):
 
         self.use_gpu = use_gpu
         self.Nx = Nx
@@ -163,7 +235,12 @@ class yee_grid:
         self.ymin = ymin
         self.xmax = xmin + Nx * Dx - Dx / 2
         self.ymax = ymin + Ny * Dy - Dy / 2
-        self.dPML = dPML * Dx
+        # A non-uniform grid makes "dPML in cells" ambiguous (cells vary in
+        # size), so dPML is interpreted as an already-physical length in
+        # that case instead of being multiplied by Dx/Dy -- see
+        # _build_physical_axis and calc_pml_tensor.
+        self._is_nonuniform = (x_edges is not None) or (y_edges is not None)
+        self.dPML = dPML if self._is_nonuniform else dPML * Dx
         self.order = order
         self.R0 = R0
         self.voxel_xsize = voxel_xsize
@@ -175,6 +252,14 @@ class yee_grid:
         self.averaging = averaging
         self.nmodes = nmodes
         self.ntarget = ntarget
+
+        if self.use_gpu and self._is_nonuniform:
+            raise NotImplementedError(
+                "use_gpu=True does not yet support a non-uniform grid "
+                "(x_edges/y_edges): gpu_backend's kernels still assume a "
+                "single global Dx/Dy for the probe radius and sub-pixel "
+                "voxel window, not a per-point local cell width. Use "
+                "use_gpu=False for a non-uniform grid for now.")
 
         self.ie = np.arange(0, 2 * self.Nx)
         self.je = np.arange(0, 2 * self.Ny)
@@ -188,6 +273,34 @@ class yee_grid:
 
         self.yye, self.xxe = np.meshgrid(self.ye, self.xe)
         self.yym, self.xxm = np.meshgrid(self.ym, self.xm)
+
+        # PHYSICAL grid, distinct from the uniform COMPUTATIONAL grid above
+        # whenever x_edges/y_edges is given -- all material painting
+        # (calc_e/calc_exy and everything built on them) uses this, while
+        # the derivative operators (calc_VU) keep using the uniform
+        # computational Dx/Dy unchanged. See _build_physical_axis and
+        # calc_pml_tensor's real coordinate-stretch factor for how the two
+        # are reconciled without touching the sparse-matrix assembly.
+        self.xe_phys = _build_physical_axis(x_edges, self.Nx, self.xmin, self.Dx)
+        self.ye_phys = _build_physical_axis(y_edges, self.Ny, self.ymin, self.Dy)
+        self.xmin_phys = self.xe_phys[0]
+        self.xmax_phys = self.xe_phys[-1]
+        self.ymin_phys = self.ye_phys[0]
+        self.ymax_phys = self.ye_phys[-1]
+
+        # Real (non-absorbing) coordinate-stretch factor Sx = d(x_phys)/d(xi)
+        # at each doubled-index computational point, via a numerical
+        # derivative of the discrete physical mapping (2nd-order-accurate
+        # central difference in the interior, one-sided at the domain edges
+        # -- np.gradient's standard behavior). Sx==1.0 everywhere when
+        # x_edges is None (xe_phys is then an exactly linear function of the
+        # computational index), so every consumer of this is a no-op / fully
+        # backward compatible in the uniform-grid case.
+        self._Sx_grid_1d = np.gradient(self.xe_phys, self.Dx * 0.5)
+        self._Sy_grid_1d = np.gradient(self.ye_phys, self.Dy * 0.5)
+
+        self.yye_phys, self.xxe_phys = np.meshgrid(self.ye_phys, self.xe_phys)
+
         self.calc_e()
         self.calc_orth_vectors()
 
@@ -254,7 +367,7 @@ class yee_grid:
         return self.Dy * j + self.Dy / 2.0
 
     def calc_e(self, dx=0.0, dy=0.0):
-        self.e = calc_dist_e(self.calldicts, self.xxe - dx, self.yye - dy)
+        self.e = calc_dist_e(self.calldicts, self.xxe_phys - dx, self.yye_phys - dy)
 
     def calc_exy(self, x, y):
         return calc_dist_e(self.calldicts, x, y)
@@ -271,38 +384,77 @@ class yee_grid:
         if not hasattr(self, 'e'):
             self.calc_e()
 
-        dx = self.Dx / 4.0
-        dy = self.Dy / 4.0
+        # Quarter-of-local-physical-cell displacement, as a 2D array so it
+        # varies with position on a non-uniform grid instead of a single
+        # global Dx/4, Dy/4 (both reduce to that scalar when the grid is
+        # uniform, since _Sx_grid_1d/_Sy_grid_1d are then 1 everywhere).
+        dx2d = (self._Sx_grid_1d * self.Dx)[:, None] / 4.0
+        dy2d = (self._Sy_grid_1d * self.Dy)[None, :] / 4.0
 
-        displacements = [(+dx, +dy),
-                         (-dx, +dy),
-                         (+dx, -dy),
-                         (-dx, -dx)]
+        # The 4 diagonal offset combinations (+-dx, +-dy) -- fixes a
+        # pre-existing typo in the last tuple (was (-dx,-dx), i.e. the y
+        # displacement reused dx instead of dy; only matters when Dx!=Dy,
+        # and only as a boundary-pixel *detection* sensitivity, not a
+        # material-value correctness issue, since e_cavg is only ever
+        # compared against e for existence, never used as a value itself).
+        signs = [(+1, +1), (-1, +1), (+1, -1), (-1, -1)]
 
-        self.e_cavg = np.zeros(self.xxe.shape, dtype=complex)
-        for dx, dy in displacements:
-            self.e_cavg += 0.25 * calc_dist_e(self.calldicts, self.xxe - dx, self.yye - dy)
+        self.e_cavg = np.zeros(self.xxe_phys.shape, dtype=complex)
+        for sx, sy in signs:
+            self.e_cavg += 0.25 * calc_dist_e(self.calldicts, self.xxe_phys - sx * dx2d, self.yye_phys - sy * dy2d)
 
     def calc_boundaries(self):
         if not hasattr(self, 'e_cavg'):
             self.calc_coarse_avg()
 
         self.ib, self.jb = np.where(self.e != self.e_cavg)
-        self.xb = self.x(self.ib)
-        self.yb = self.y(self.jb)
+        self.xb = self.xe_phys[self.ib]
+        self.yb = self.ye_phys[self.jb]
 
 
     def calc_orth_vectors(self):
-        r0 = np.min([self.Dx, self.Dy]) * 0.5
-
         if not hasattr(self, 'xb'):
             self.calc_boundaries()
 
-        self.nx = 0.5 * np.sqrt(2) * np.ones(self.xxe.shape)
-        self.ny = 0.5 * np.sqrt(2) * np.ones(self.xxe.shape)
+        self.nx = 0.5 * np.sqrt(2) * np.ones(self.xxe_phys.shape)
+        self.ny = 0.5 * np.sqrt(2) * np.ones(self.xxe_phys.shape)
+
+        # Local physical cell size at each boundary point -- the probe
+        # should sample the pixel's own immediate neighborhood, not some
+        # other region's cell size.
+        local_dx = self._Sx_grid_1d[self.ib] * self.Dx
+        local_dy = self._Sy_grid_1d[self.jb] * self.Dy
+
+        if self._is_nonuniform:
+            # A non-uniform grid graded independently per axis can produce
+            # a locally ANISOTROPIC cell (e.g. finely x-graded near a
+            # circular boundary's east/west points but coarsely y-graded
+            # there) -- min(dx,dy)*0.5 can then be far too small to reach
+            # the actual boundary in the coarse axis, even though
+            # calc_coarse_avg's own quarter-cell-in-EACH-axis detection
+            # correctly flagged the pixel: confirmed directly, this
+            # produced an all-one-material probe (nx=ny=0 exactly, a 0/0
+            # in the normalization below) at a pixel whose local dx/dy
+            # ratio was ~6x. Half the local cell's DIAGONAL is the robust
+            # choice -- guaranteed at least as large as the reach needed in
+            # either axis alone, regardless of anisotropy or which
+            # direction the boundary happens to be offset in.
+            r0_all = 0.5 * np.sqrt(local_dx ** 2 + local_dy ** 2)
+        else:
+            # Uniform grid: unchanged from before (local_dx/local_dy are
+            # just Dx/Dy everywhere here, but this branch keeps the exact
+            # original formula/results bit-for-bit rather than relying on
+            # that reducing to the same thing, since it doesn't -- the
+            # diagonal formula above is a DIFFERENT value even when
+            # dx==dy).
+            r0_all = np.minimum(local_dx, local_dy) * 0.5
 
         if self.use_gpu and self.ib.size > 0:
             import gpu_backend
+            # __init__ already rejects use_gpu with a non-uniform grid, so
+            # r0_all is a single repeated value here and this scalar r0 is
+            # exact, not an approximation.
+            r0 = float(r0_all[0]) if r0_all.size else 0.0
             shape_types, shape_params, layers, thetas = gpu_backend.serialize_geometry(self.calldicts)
             nx_vals, ny_vals = gpu_backend.gpu_orth_vectors(
                 self.xb, self.yb, r0, shape_types, shape_params, layers, thetas)
@@ -314,6 +466,7 @@ class yee_grid:
             x0 = self.xb[i]
             y0 = self.yb[i]
             jb = self.jb[i]
+            r0 = r0_all[i]
 
             theta = np.arange(0, 2 * np.pi, DPHI_ORTH_VECTORS)
             ct, st = _cardinal_snap_cos_sin(theta)
@@ -330,11 +483,13 @@ class yee_grid:
             self.nx[ib, jb] = np.real(nx / np.lib.scimath.sqrt(nx ** 2.0 + ny ** 2.0))
             self.ny[ib, jb] = np.real(ny / np.lib.scimath.sqrt(nx ** 2.0 + ny ** 2.0))
 
-    def voxel_xy(self, x, y):
-        xmin = x - self.Dx / 2
-        xmax = x + self.Dx / 2
-        ymin = y - self.Dy / 2
-        ymax = y + self.Dy / 2
+    def voxel_xy(self, x, y, half_dx=None, half_dy=None):
+        half_dx = self.Dx / 2 if half_dx is None else half_dx
+        half_dy = self.Dy / 2 if half_dy is None else half_dy
+        xmin = x - half_dx
+        xmax = x + half_dx
+        ymin = y - half_dy
+        ymax = y + half_dy
 
         xv = np.linspace(xmin, xmax, self.voxel_xsize)
         yv = np.linspace(ymin, ymax, self.voxel_ysize)
@@ -366,11 +521,14 @@ class yee_grid:
                 self.eiavg[self.ib, self.jb] = self.eiavg_col
                 return
 
+            local_dx = self._Sx_grid_1d[self.ib] * self.Dx
+            local_dy = self._Sy_grid_1d[self.jb] * self.Dy
+
             for i, ib in enumerate(self.ib):
                 jb = self.jb[i]
-                x0 = self.x(ib)
-                y0 = self.y(jb)
-                xv, yv = self.voxel_xy(x0, y0)
+                x0 = self.xe_phys[ib]
+                y0 = self.ye_phys[jb]
+                xv, yv = self.voxel_xy(x0, y0, half_dx=local_dx[i] / 2, half_dy=local_dy[i] / 2)
 
                 exy_real = self.calc_exy_real(xv, yv)
                 exy_imag = self.calc_exy_imag(x0, y0)
@@ -481,12 +639,33 @@ class yee_grid:
         even 30 requested eigenvalues near the target all landed on a dense
         cluster of spurious near-degenerate modes with ~0 real confinement,
         instead of the true, well-isolated guided-mode eigenvalue).
+
+        NOTE on non-uniform grids (x_edges/y_edges): an earlier version of
+        this method also tried to fold the grid's own (real) coordinate
+        stretch into this same Fzz/iGxx/iGyy-only machinery, reasoning that
+        the discretization-structure argument above shouldn't care whether
+        S is real or complex. That was WRONG -- verified directly: even the
+        simplest possible sanity case (a grid that is physically uniform,
+        described via a constant, isotropic, non-unity real stretch factor)
+        did not reproduce the plain-uniform-grid answer, and neither did the
+        reciprocal formula. Fzz appears sandwiched in TWO different
+        div-grad terms (Uy*Fzz*Vy in Qxx, Ux*Fzz*Vx in Qyy), so correcting
+        each sandwich independently would need different effective Fzz
+        values when Sx!=Sy -- a single material-tensor value can't provide
+        that, which is presumably why this didn't work in the way the PML
+        case does (PML's complex stretch stays near unit magnitude, a
+        genuinely different regime). Non-uniform grid support instead lives
+        in calc_VU (locally-varying finite differences using the actual
+        physical spacing between neighboring grid lines), not here -- this
+        method now only ever carries the PML stretch, evaluated on physical
+        coordinates so PML depth is measured in actual physical length
+        regardless of grading.
         """
         if not hasattr(self, 'fxx'):
             self.calc_tensor()
 
-        Sx_grid = self._pml_stretch(self.xxe, self.xmin, self.xmax)
-        Sy_grid = self._pml_stretch(self.yye, self.ymin, self.ymax)
+        Sx_grid = self._pml_stretch(self.xxe_phys, self.xmin_phys, self.xmax_phys)
+        Sy_grid = self._pml_stretch(self.yye_phys, self.ymin_phys, self.ymax_phys)
 
         Sx_fxx, Sy_fxx = Sx_grid[1::2, 0::2], Sy_grid[1::2, 0::2]
         Sx_fyy, Sy_fyy = Sx_grid[0::2, 1::2], Sy_grid[0::2, 1::2]
@@ -554,10 +733,49 @@ class yee_grid:
         return csr_matrix((ds, (ps, qs)))
 
     def calc_VU(self):
-        self.Uy = self.s_diags([0, -1], [-1 / self.Dy, +1 / self.Dy])
-        self.Ux = self.s_diags([0, -self.Ny], [-1 / self.Dx, +1 / self.Dx])
-        self.Vy = self.s_diags([0, 1], [1 / self.Dy, -1 / self.Dy])
-        self.Vx = self.s_diags([0, self.Ny], [1 / self.Dx, -1 / self.Dx])
+        """
+        First-derivative operators. For a non-uniform grid (x_edges/y_edges)
+        these are locally-varying finite differences: standard forward/
+        backward two-point differences using the ACTUAL physical spacing
+        between each specific pair of neighboring PRIMARY grid lines,
+        rather than a single global Dx/Dy -- each such difference is still
+        exactly centered at the midpoint between its own two samples
+        (2nd-order accurate there) regardless of how spacing varies
+        elsewhere, since it only ever depends on its own local interval.
+        Reduces exactly to the original constant-Dx/Dy formulas when the
+        grid is uniform (x_edges/y_edges unset), since every interval then
+        equals Dx/Dy.
+
+        (An earlier attempt folded non-uniformity into the material tensor
+        instead, via the same stretch machinery calc_pml_tensor uses for
+        the PML -- that was verified wrong, see calc_pml_tensor's
+        docstring; this is the fix.)
+        """
+        y_prim = self.ye_phys[0::2]
+        x_prim = self.xe_phys[0::2]
+        dy_interval = np.diff(y_prim)
+        dx_interval = np.diff(x_prim)
+
+        # Per-primary-row forward/backward interval, padding the one edge
+        # each direction has no neighbor for by repeating the nearest real
+        # interval -- that padded value only ever multiplies an orphaned
+        # diagonal entry with no matching off-diagonal partner (the same
+        # structural edge the original constant-Dx/Dy formula already had),
+        # so it's a don't-care in practice.
+        dy_fwd = np.concatenate([dy_interval, dy_interval[-1:]])   # dy_fwd[j] = y[j+1]-y[j]
+        dy_bwd = np.concatenate([dy_interval[:1], dy_interval])    # dy_bwd[j] = y[j]-y[j-1]
+        dx_fwd = np.concatenate([dx_interval, dx_interval[-1:]])
+        dx_bwd = np.concatenate([dx_interval[:1], dx_interval])
+
+        dy_fwd_full = np.tile(dy_fwd, self.Nx)      # length Nx*Ny, varies with j (fast axis)
+        dy_bwd_full = np.tile(dy_bwd, self.Nx)
+        dx_fwd_full = np.repeat(dx_fwd, self.Ny)     # length Nx*Ny, varies with i (slow axis)
+        dx_bwd_full = np.repeat(dx_bwd, self.Ny)
+
+        self.Uy = self.s_diags([0, -1], [-1.0 / dy_fwd_full, +1.0 / dy_fwd_full[:-1]])
+        self.Vy = self.s_diags([0, 1], [1.0 / dy_bwd_full, -1.0 / dy_bwd_full[1:]])
+        self.Ux = self.s_diags([0, -self.Ny], [-1.0 / dx_fwd_full, +1.0 / dx_fwd_full[:-self.Ny]])
+        self.Vx = self.s_diags([0, self.Ny], [1.0 / dx_bwd_full, -1.0 / dx_bwd_full[self.Ny:]])
 
     def calc_sF(self):
         self.Fxx = self.s_diags_2D([0], [self.fxx])

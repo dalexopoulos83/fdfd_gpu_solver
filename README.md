@@ -1,9 +1,9 @@
 # fdfd_gpu_solver
 
-GPU-accelerated variant of [pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver)'s FDFD
-mode solver, forked to add PyCUDA acceleration for grid construction. **Scope, by request:**
-matrix-assembly acceleration only (`calc_orth_vectors` + `calc_eavg`) on the existing **uniform**
-Yee grid -- a non-uniform/graded grid was explicitly deferred to a later pass, not attempted here.
+Extended variant of [pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver)'s FDFD mode
+solver: PyCUDA acceleration for grid construction, plus non-uniform (graded) grid support. The two
+features are independent and can be used separately (see "Not in scope" for the one combination
+that isn't supported yet: `use_gpu=True` together with a non-uniform grid).
 
 ## What's accelerated, and why just this
 
@@ -73,7 +73,72 @@ geometry tested (typically far tighter; that figure is the observed worst case, 
 multilayer HPW).
 
 `test_fdfd_2D_solver.py` (ported unchanged from `pyfdfdsolver`, all `use_gpu=False`) confirms
-nothing regressed on the CPU path.
+nothing regressed on the CPU path. `test_nonuniform_grid.py` covers the non-uniform-grid feature
+below. All three (`python -m unittest test_fdfd_2D_solver test_gpu_equivalence
+test_nonuniform_grid`) currently pass: 25/25.
+
+## Non-uniform grid
+
+`yee_grid` accepts optional `x_edges`/`y_edges`: explicit, strictly-increasing arrays of `Nx`/`Ny`
+physical grid-line positions, letting you concentrate resolution near a material interface (e.g. a
+waveguide's edges) instead of spreading a fixed point budget uniformly across the whole domain.
+Omit them (the default) for the original uniform grid, byte-for-byte unchanged.
+
+```python
+from fdfd_2D_solver import yee_grid, graded_edges
+
+x_edges = graded_edges(N=150, xmin=-1.5, xmax=1.5, targets=[-0.25, 0.25], width=0.05, boost=6.0)
+y_edges = graded_edges(N=150, xmin=-1.5, xmax=1.5, targets=[-0.15, 0.15], width=0.05, boost=6.0)
+s = yee_grid(Nx=150, Ny=150, Dx=..., Dy=..., calldicts=geometry, omega=..., nmodes=2, ntarget=2.5,
+              x_edges=x_edges, y_edges=y_edges)
+```
+
+`graded_edges` is a convenience helper: standard inverse-CDF mesh grading (build a smooth target
+point-density profile -- baseline 1, boosted near each `targets` location by a Gaussian bump of the
+given `width` -- then invert its cumulative distribution at `N` equally-spaced quantiles). You can
+also build `x_edges`/`y_edges` by hand for full control.
+
+### Why locally-varying finite differences, not a coordinate-stretch tensor
+
+The "obvious" design -- reuse the PML's existing coordinate-stretch machinery (which already
+multiplies a stretch factor into `Fzz`/`iGxx`/`iGyy`), just with a real stretch factor instead of
+PML's complex one -- **does not work**, and this repo's history includes that attempt and why it
+failed, rather than silently discarding it: even the simplest possible sanity case (a grid that is
+*physically* uniform, described via a constant, non-unity real stretch factor) did not reproduce
+the plain-uniform-grid answer, with either sign of the stretch exponent. Working through why: `Fzz`
+appears sandwiched in **two** different div-grad terms (`Uy*Fzz*Vy` in `Qxx`, `Ux*Fzz*Vx` in
+`Qyy`), so correcting each sandwich independently would need different effective `Fzz` values
+whenever `Sx != Sy` -- a single material-tensor value can't provide that. PML's complex stretch
+apparently gets away with the material-tensor-only approach because it stays near unit magnitude
+(a phase/absorption effect, not an actual distance rescaling); a real grid-grading stretch factor
+is not near unity by construction, and hits this limitation directly.
+
+What's implemented instead, in `calc_VU`: ordinary forward/backward two-point differences using
+the **actual local physical spacing** between each specific pair of neighboring grid lines, rather
+than a single global `Dx`/`Dy`. This needs no new tensor machinery and is provably exact: any
+two-point difference `(f[j+1]-f[j])/h_j` is 2nd-order accurate at its own midpoint for *any* `h_j`
+(basic Taylor analysis) -- grading never degrades the formal accuracy order, regardless of how
+spacing varies elsewhere. Verified directly (`test_nonuniform_grid.py`,
+`test_derivative_operators_are_bit_identical`): a grid built through `x_edges` that is physically
+identical to a plain uniform grid produces bit-identical `Ux`/`Uy`/`Vx`/`Vy` matrices, not just a
+close solved answer.
+
+`calc_pml_tensor` keeps its original PML-only role (now evaluated on physical coordinates, so PML
+depth is measured in actual physical length regardless of grading) -- the grid-stretch composition
+was removed from it, back to exactly the form validated in `pyfdfdsolver`.
+
+### Does it actually help?
+
+`test_nonuniform_grid.py`'s `GradedGridImprovesAccuracyTest`, on the paper-validated step-index
+fiber (closed-form reference `neff=1.438604`): at a matched N=60 grid-point budget, a uniform grid
+gives error `3.3e-5`; concentrating resolution near the core boundary (`graded_edges(...,
+width=1.0, boost=6.0)`) gives error `9.4e-7` -- roughly **35x** better at the same cost. The
+benefit is largest at coarse-to-moderate resolution (where "wasted" uniform points in the cladding
+matter most) and requires the grading to actually cover the geometry's interfaces -- e.g. a
+circular boundary, graded independently per axis around 4 "compass points," under-resolves the
+boundary at intermediate angles; this codebase's actual target (rectangular/multilayer waveguide
+interfaces, which really do sit at constant x or constant y) is the natural fit for separable
+per-axis grading like this.
 
 ## Benchmark (`benchmark_gpu.py`)
 
@@ -115,8 +180,10 @@ same pure NumPy/SciPy `pyfdfdsolver` code path.
 
 ## Not in scope here
 
-- **Non-uniform/graded grid** -- explicitly deferred; `Dx`/`Dy` are still uniform across the whole
-  domain, same as `pyfdfdsolver`.
+- **`use_gpu=True` with a non-uniform grid** -- `gpu_backend`'s kernels still assume a single
+  global `Dx`/`Dy` for the sub-pixel voxel window and probe radius, not a per-point local cell
+  width; `yee_grid.__init__` raises `NotImplementedError` for this combination rather than
+  silently giving a wrong answer. Use `use_gpu=False` for a non-uniform grid for now.
 - **GPU eigensolver** -- `scipy.sparse.linalg.eigs` (CPU/ARPACK) is unchanged; porting the
   shift-invert generalized sparse eigenproblem to `cuSOLVER`/`cuSPARSE` was explicitly scoped out
   as a much larger, separate undertaking.
