@@ -190,3 +190,10 @@ same pure NumPy/SciPy `pyfdfdsolver` code path.
 - **GPU eigensolver** -- `scipy.sparse.linalg.eigs` (CPU/ARPACK) is unchanged; porting the
   shift-invert generalized sparse eigenproblem to `cuSOLVER`/`cuSPARSE` was explicitly scoped out
   as a much larger, separate undertaking.
+
+## Citation
+
+DOI: *pending (Zenodo archival)* -- see [CITATION.cff](CITATION.cff) for citation metadata and the
+accompanying paper reference. This is a fork of
+[pyfdfdsolver](https://github.com/dalexopoulos83/pyfdfdsolver); see that repo for the base CPU
+solver's own DOI.
