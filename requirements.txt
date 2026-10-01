@@ -1,3 +1,5 @@
 numpy
 scipy
 pycuda
+matplotlib
+scikit-optimize

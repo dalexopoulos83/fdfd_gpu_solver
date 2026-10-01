@@ -26,6 +26,48 @@ the same shape types as the CPU solver (`rectangle`, `multilayer_rect`, `circle`
 
 ## Usage
 
+As in `pyfdfdsolver`, the entry point is `fdfd_2D.py`: pick an example structure with
+`case = 1/2/3` at the top, then run `python fdfd_2D.py`:
+
+1. step-index fiber
+2. microstructured optical fiber
+3. rectangular hybrid plasmonic waveguide on SOI (Si / SiO2 spacer / Ag), using the winning
+   geometry from the `fdfd_optimization_benchmarking` optimization runs. This replaces the
+   original's cylindrical HPW.
+
+The switches just below `case`:
+
+- `use_gpu` (default `True`) runs `calc_orth_vectors`/`calc_eavg` on the GPU. Set it to `False`
+  for the original CPU path.
+- `nonuniform` (default `True`) builds a graded mesh with `graded_edges`, concentrating the same
+  point budget on the waveguiding region. For case 3 that is the Si/SiO2/Ag stack, finest around
+  the spacer gap. `grid_boost` sets how much denser it gets there. Set `nonuniform` to `False` for
+  the original uniform grid.
+- `dPML_cells` sets the PML depth in cells of the equivalent uniform grid. With a graded mesh it is
+  converted to a physical length, so both modes get the same PML depth.
+
+Three more switches choose what the script runs. They are independent and run in this order:
+
+- `run_optimization` (default `False`, case 3 only): Bayesian optimization (`skopt.gp_minimize`)
+  of the HPW's width, layer heights, `n_target` and metal. It uses the same objective and bounds as
+  `fdfd_optimization_benchmarking`: maximize propagation length and the vectorial nonlinear
+  coefficient γ. `opt_n_calls`/`opt_n_initial`/`opt_N` set the budget. The best design found
+  replaces the default geometry for the convergence test and the plots. This needs
+  `scikit-optimize`.
+- `run_convergence` (default `True`): `neff` vs `N` for every mode, comparing all four averaging
+  schemes (`tensor`, `straight`, `inverse`, `none`) against the reference `neff`.
+- `run_mode_plots` (default `True`): solves once at `N_plot` and plots the structure (Re(n) with
+  the mesh lines, full domain and zoomed on the waveguide), |E| for every mode, the six field
+  components of the selected mode, and a |E| cut at x = 0. For case 3 it also prints the mode's
+  `neff`, propagation length, γ and FOM. The plotted mode is the hybrid plasmonic mode, picked the
+  same way as in the benchmark: the mode with the most power in the spacer gap.
+
+Apart from the convergence test's comparison, every solve in the script uses the paper's tensor
+subpixel averaging (`averaging='tensor'`). With `run_convergence = False`, only tensor averaging
+runs.
+
+To use the solver from your own code:
+
 ```python
 from fdfd_2D_solver import yee_grid
 
