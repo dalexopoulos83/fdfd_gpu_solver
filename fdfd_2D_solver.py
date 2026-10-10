@@ -2,7 +2,7 @@ import sys
 import traceback
 import numpy as np
 from scipy.sparse import csr_matrix, hstack, vstack, eye
-from scipy.sparse.linalg import eigs
+from scipy.sparse.linalg import eigs, LinearOperator
 
 DPHI_ORTH_VECTORS = np.pi / 25
 E0 = 8.854e-12
@@ -224,8 +224,11 @@ class yee_grid:
                  voxel_xsize=100, voxel_ysize=100,
                  dPML=5, order=2, R0 = 1e-17, sigma_max=1.0, omega=1.0,
                  averaging='tensor', nmodes=1, ntarget=None, use_gpu=False,
-                 x_edges=None, y_edges=None):
+                 x_edges=None, y_edges=None, eig_solver='superlu'):
 
+        if eig_solver not in ('superlu', 'pardiso'):
+            raise ValueError("eig_solver must be 'superlu' or 'pardiso'")
+        self.eig_solver = eig_solver
         self.use_gpu = use_gpu
         self.Nx = Nx
         self.Ny = Ny
@@ -850,7 +853,21 @@ class yee_grid:
             n = self.Q.shape[0]
             v0 = np.random.RandomState(0).rand(n)
             ncv = min(n, max(4 * self.nmodes + 1, 40))
-            self.wq, self.vq = eigs(self.Q, self.nmodes, M=self.Bq, sigma=self.targ, v0=v0, ncv=ncv)
+            if self.eig_solver == 'pardiso':
+                # Same shift-invert eigs() call, with the (Q - sigma*Bq)^-1
+                # operator factorised by multi-threaded MKL PARDISO instead
+                # of eigs()'s built-in single-threaded SuperLU -- see
+                # pardiso_backend.py
+                import pardiso_backend
+                lu = pardiso_backend.PardisoLU(self.Q - self.targ * self.Bq)
+                OPinv = LinearOperator((n, n), matvec=lu.solve, dtype=complex)
+                try:
+                    self.wq, self.vq = eigs(self.Q, self.nmodes, M=self.Bq, sigma=self.targ,
+                                            v0=v0, ncv=ncv, OPinv=OPinv)
+                finally:
+                    lu.free()
+            else:
+                self.wq, self.vq = eigs(self.Q, self.nmodes, M=self.Bq, sigma=self.targ, v0=v0, ncv=ncv)
             self.k0 = self.omega / C0
             self.neff_q = np.emath.sqrt(self.wq / self.k0 ** 2.0)
             self.calc_fields()
