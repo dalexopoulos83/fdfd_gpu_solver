@@ -22,6 +22,10 @@ case = 3
 # Run calc_orth_vectors/calc_eavg on the GPU (PyCUDA); False = original CPU path
 use_gpu = True
 
+# Sparse LU behind the eigensolve: 'pardiso' = multi-threaded MKL PARDISO (2-4.5x faster
+# solves, needs the MKL runtime), 'superlu' = scipy's original single-threaded SuperLU
+eig_solver = 'pardiso'
+
 # Non-uniform (graded) mesh, denser around the waveguiding region; False = uniform grid
 nonuniform = True
 grid_boost = 6.0   # point density near the waveguiding region is ~(1 + grid_boost)x the baseline
@@ -30,7 +34,7 @@ dPML_cells = 5     # PML depth in cells of the equivalent uniform grid
 
 # What to run
 run_optimization = False   # Bayesian optimization of the HPW geometry (case 3 only, needs scikit-optimize)
-run_convergence = True     # neff vs N for all four averaging schemes (otherwise only tensor averaging runs)
+run_convergence = False     # neff vs N for all four averaging schemes (otherwise only tensor averaging runs)
 run_mode_plots = True      # structure + mode field plots
 
 # Bayesian optimization settings (same objective and bounds as fdfd_optimization_benchmarking)
@@ -215,7 +219,8 @@ def make_solver(N, fiber_dict, grading, averaging = 'tensor', nt = None, verbose
     return yee_grid(Nx, Ny, Dx, Dy, fiber_dict, xmin = xmin, ymin = ymin, omega = omega,
                     averaging = averaging, nmodes = nmodes,
                     ntarget = ntarget if nt is None else nt, dPML = dPML,
-                    use_gpu = use_gpu, x_edges = x_edges, y_edges = y_edges)
+                    use_gpu = use_gpu, x_edges = x_edges, y_edges = y_edges,
+                    eig_solver = eig_solver)
 
 
 # =============================================================================

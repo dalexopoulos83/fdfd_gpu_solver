@@ -115,8 +115,9 @@ multilayer HPW).
 
 `test_fdfd_2D_solver.py` (ported unchanged from `pyfdfdsolver`, all `use_gpu=False`) confirms
 nothing regressed on the CPU path. `test_nonuniform_grid.py` covers the non-uniform-grid feature
-below. All three (`python -m unittest test_fdfd_2D_solver test_gpu_equivalence
-test_nonuniform_grid`) currently pass: 25/25.
+below, and `test_pardiso_solver.py` the PARDISO eigensolve option. All four (`python -m unittest
+test_fdfd_2D_solver test_gpu_equivalence test_nonuniform_grid test_pardiso_solver`) currently
+pass: 31/31.
 
 ## Non-uniform grid
 
@@ -206,6 +207,43 @@ one-time ~4s cost (CUDA context creation + `nvcc` kernel compilation); `gpu_back
 the kernel module once per process (a module-level cache), not once per `yee_grid` instance, so
 this cost is paid at most once regardless of how many solves a run does.
 
+## Faster eigensolve: MKL PARDISO (`eig_solver='pardiso'`)
+
+Once the grid construction is on the GPU, the eigensolve is almost the whole run. Profiled on the
+case-3 HPW (graded grid, `use_gpu=True`), `eigs()` takes 89% of a solve at N=100 and 97% at N=300.
+Most of that is the single-threaded SuperLU factorisation of `Q - sigma*Bq` that shift-invert
+needs (47% at N=100, 73% at N=300).
+
+`yee_grid(..., eig_solver='pardiso')` factorises that matrix with Intel MKL PARDISO on all CPU
+cores instead (`pardiso_backend.py`), and passes it to the same `eigs()` call through `OPinv`. The
+eigenproblem, ARPACK and everything after it are unchanged. Same machine, same geometry, full
+construction + solve:
+
+| N   | SuperLU (s) | PARDISO (s) | speedup |
+|-----|-------------|-------------|---------|
+| 100 | 1.86        | 0.90        | 2.1x    |
+| 150 | 5.64        | 2.31        | 2.4x    |
+| 200 | 10.53       | 3.33        | 3.2x    |
+| 300 | 36.07       | 8.07        | 4.5x    |
+
+`neff` agrees to within 5e-14 and the eigenvectors are identical (overlap 1 to 12 digits);
+`test_pardiso_solver.py` checks this on a lossy HPW (uniform and graded grid) and a lossless fiber.
+
+PARDISO needs the MKL runtime (`mkl_rt`), which MKL-linked NumPy installs such as Anaconda's
+already include. Set `MKL_RT_PATH` if it isn't found. `pypardiso` can't be used here, because it
+only supports real matrices and this one is complex (lossy metal, complex PML), so
+`pardiso_backend.py` is a small ctypes wrapper for PARDISO's complex non-symmetric matrix type.
+The default stays `eig_solver='superlu'`, unchanged.
+
+At N=300 with PARDISO the factorisation is down to about 2 s of a 6.5 s solve; the 41 triangular
+solves ARPACK does with it now take more (about 3.1 s).
+
+Why not the GPU: this problem needs complex double precision (Im(neff) ~1e-4 next to Re(neff)
+~2.6), and consumer/laptop GPUs such as the T500 run FP64 at 1/32 of their FP32 rate. CuPy has no
+non-Hermitian shift-invert eigensolver, and the sparse triangular solves inside ARPACK's iterations
+parallelise poorly on a GPU. A GPU eigensolve (e.g. NVIDIA cuDSS behind the same `OPinv` hook)
+might pay off on a data-center GPU with full FP64 for large N, but this hasn't been tested.
+
 ## GPU toolchain note (Windows)
 
 If `nvcc`-compiled kernels segfault/access-violate specifically at *launch* (not compile) on
@@ -229,9 +267,9 @@ same pure NumPy/SciPy `pyfdfdsolver` code path.
 
 ## Not in scope here
 
-- **GPU eigensolver** -- `scipy.sparse.linalg.eigs` (CPU/ARPACK) is unchanged; porting the
-  shift-invert generalized sparse eigenproblem to `cuSOLVER`/`cuSPARSE` was explicitly scoped out
-  as a much larger, separate undertaking.
+- **GPU eigensolver** -- `scipy.sparse.linalg.eigs` (CPU/ARPACK) is unchanged; see the PARDISO
+  section above for the CPU speed-up used instead and why a GPU eigensolve isn't expected to help
+  on consumer GPUs.
 
 ## Citation
 
