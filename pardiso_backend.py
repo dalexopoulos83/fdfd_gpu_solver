@@ -71,6 +71,24 @@ def _load_mkl():
     return _libmkl
 
 
+def _apply_thread_limit(lib):
+    """Honours MKL_NUM_THREADS/OMP_NUM_THREADS even when they were set after MKL
+    was loaded (e.g. by a multiprocessing Pool initializer that pins each worker
+    to one thread), so parallel workers don't oversubscribe the CPU."""
+    value = os.environ.get('MKL_NUM_THREADS') or os.environ.get('OMP_NUM_THREADS')
+    if not value:
+        return
+    try:
+        n = int(value)
+    except ValueError:
+        return
+    setter = getattr(lib, 'MKL_Set_Num_Threads', None)
+    if setter is not None and n > 0:
+        setter.argtypes = [ctypes.c_int]
+        setter.restype = None
+        setter(n)
+
+
 def is_available():
     try:
         _load_mkl()
@@ -84,6 +102,7 @@ class PardisoLU:
 
     def __init__(self, A):
         self._lib = _load_mkl()
+        _apply_thread_limit(self._lib)
         A = sp.csr_matrix(A, dtype=np.complex128)
         A.sort_indices()
         self.n = A.shape[0]
